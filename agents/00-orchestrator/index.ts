@@ -4,8 +4,190 @@
  */
 
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // Types et interfaces pour l'orchestration
+
+// --- START: Master Configuration Interfaces ---
+
+interface MasterConfigFile {
+  orchestrator: OrchestratorInfoJson;
+  configuration: OrchestratorConfigJson;
+  agents: { [key: string]: AgentDefinitionJson };
+  workflows: { [key: string]: WorkflowDefinitionJson };
+  communication: CommunicationConfigJson;
+  monitoring: MonitoringConfigJson;
+  conflictResolution: ConflictResolutionConfigJson;
+  quality: QualityConfigJson;
+  integrations: IntegrationsConfigJson;
+  metadata: MetadataJson;
+}
+
+interface OrchestratorInfoJson {
+  version: string;
+  name: string;
+  description: string;
+  status: string;
+  capabilities: string[];
+}
+
+// Corresponds to the existing OrchestratorConfig, but as defined in JSON
+interface OrchestratorConfigJson {
+  maxConcurrentAgents: number;
+  timeoutMs: number;
+  retryAttempts: number;
+  priorityLevels: string[];
+  resourceLimits: ResourceLimitsJson; // Existing ResourceLimits can be reused if identical
+}
+
+// Assuming ResourceLimitsJson is similar to existing ResourceLimits
+type ResourceLimitsJson = ResourceLimits;
+
+interface AgentDefinitionJson {
+  id: string;
+  name: string;
+  role: string;
+  status: string;
+  capabilities: string[];
+  specializations: string[];
+  performance: AgentPerformanceJson;
+}
+
+interface AgentPerformanceJson {
+  averageTaskTime: string; // e.g., "3h"
+  qualityScore: number;
+  successRate: number;
+}
+
+interface WorkflowDefinitionJson {
+  id: string;
+  name: string;
+  description: string;
+  estimatedDuration: string; // e.g., "10.5h"
+  efficiencyGain: string; // e.g., "25%"
+  phases: WorkflowPhaseJson[];
+}
+
+interface WorkflowPhaseJson {
+  id: string;
+  name: string;
+  parallel: boolean;
+  dependencies?: string[];
+  estimatedTime: string; // e.g., "3h"
+  agents: string[]; // List of agent IDs
+  deliverables: string[];
+}
+
+interface CommunicationChannelJson {
+  id: string;
+  name: string;
+  type: string;
+  persistent: boolean;
+  participants?: string[]; // Optional as some might be broadcast
+}
+
+interface CommunicationProtocolsJson {
+    heartbeatInterval: number;
+    messageRetention: number;
+    timeoutMs: number;
+    retryAttempts: number;
+}
+
+interface CommunicationConfigJson {
+  channels: CommunicationChannelJson[];
+  protocols: CommunicationProtocolsJson;
+}
+
+interface AlertThresholdsDetailsJson {
+    memoryUtilization?: number;
+    cpuUtilization?: number;
+    responseTime?: number;
+    errorRate?: number;
+    successRate?: number;
+    delayThreshold?: number;
+    qualityThreshold?: number;
+    budgetVariance?: number;
+}
+
+interface AlertThresholdsJson {
+    system: AlertThresholdsDetailsJson;
+    agents: AlertThresholdsDetailsJson;
+    projects: AlertThresholdsDetailsJson;
+}
+
+interface MetricsCollectionJson {
+    interval: number;
+    retention: string;
+    maxHistory: number;
+}
+
+interface MonitoringConfigJson {
+  metricsCollection: MetricsCollectionJson;
+  alertThresholds: AlertThresholdsJson;
+}
+
+interface ConflictStrategyJson {
+    type: string;
+    strategy: string;
+    priority: number;
+}
+
+interface EscalationRulesJson {
+    maxAttempts: number;
+    criticalImmediateEscalation: boolean;
+    timeoutEscalation: number;
+}
+
+interface ConflictResolutionConfigJson {
+  strategies: ConflictStrategyJson[];
+  escalationRules: EscalationRulesJson;
+}
+
+interface QualityStandardsJson {
+    codeQuality: number;
+    testCoverage: number;
+    documentation: number;
+    performance: number;
+}
+
+interface ReviewProcessJson {
+    automated: boolean;
+    peerReview: boolean;
+    clientReview: boolean;
+}
+
+interface QualityConfigJson {
+  standards: QualityStandardsJson;
+  reviewProcess: ReviewProcessJson;
+}
+
+interface ApiIntegrationJson {
+    enabled: boolean;
+    rateLimit?: number; // Optional for some APIs
+    deploymentAutomation?: boolean; // Specific to Vercel
+}
+
+interface ToolIntegrationJson {
+    enabled: boolean;
+    host?: string; // Specific to n8n
+    provider?: string; // Specific to analytics
+}
+
+interface IntegrationsConfigJson {
+  apis: { [key: string]: ApiIntegrationJson }; // e.g., anthropic, openai, vercel
+  tools: { [key: string]: ToolIntegrationJson }; // e.g., n8n, analytics
+}
+
+interface MetadataJson {
+    createdAt: string;
+    lastUpdated: string;
+    version: string;
+    environment: string;
+    maintainer: string;
+}
+
+// --- END: Master Configuration Interfaces ---
 export interface OrchestratorConfig {
   maxConcurrentAgents: number;
   timeoutMs: number;
@@ -123,28 +305,42 @@ export interface ResourceUsage {
 
 export class MasterOrchestrator extends EventEmitter {
   private config: OrchestratorConfig;
+  private masterConfigFile: MasterConfigFile; // Store the loaded config
   private agents: Map<string, AgentStatus> = new Map();
   private projects: Map<string, ProjectSpec> = new Map();
   private tasks: Map<string, AgentTask> = new Map();
-  private workflows: Map<string, WorkflowDefinition> = new Map();
+  // ADJUSTED: this.workflows will now store WorkflowDefinitionConfig
+  private workflows: Map<string, WorkflowDefinitionConfig> = new Map();
   private isRunning: boolean = false;
   private taskQueue: AgentTask[] = [];
   private activeExecutions: Map<string, Promise<any>> = new Map();
 
   constructor(config?: Partial<OrchestratorConfig>) {
     super();
+
+    try {
+      const configPath = path.join(__dirname, 'master-config.json');
+      const configFileContent = fs.readFileSync(configPath, 'utf-8');
+      this.masterConfigFile = JSON.parse(configFileContent) as MasterConfigFile;
+    } catch (error) {
+      console.error("Failed to load or parse master-config.json:", error);
+      // Depending on recovery strategy, either throw or use hardcoded defaults as a fallback
+      throw new Error("MasterOrchestrator: Critical configuration error. Could not load master-config.json.");
+    }
+
+    // Populate this.config from masterConfigFile, allowing overrides from constructor argument
+    // Default values from masterConfigFile.configuration
+    const defaultConfigFromFile: OrchestratorConfig = {
+        maxConcurrentAgents: this.masterConfigFile.configuration.maxConcurrentAgents,
+        timeoutMs: this.masterConfigFile.configuration.timeoutMs,
+        retryAttempts: this.masterConfigFile.configuration.retryAttempts,
+        priorityLevels: [...this.masterConfigFile.configuration.priorityLevels],
+        resourceLimits: { ...this.masterConfigFile.configuration.resourceLimits }
+    };
+
     this.config = {
-      maxConcurrentAgents: 6,
-      timeoutMs: 300000, // 5 minutes
-      retryAttempts: 3,
-      priorityLevels: ['critical', 'high', 'medium', 'low'],
-      resourceLimits: {
-        memory: 8192, // 8GB
-        cpu: 80, // 80%
-        concurrent: 10,
-        apiCallsPerMinute: 60
-      },
-      ...config
+        ...defaultConfigFromFile, // Load from file first
+        ...config // Then override with constructor argument if provided
     };
     
     this.initializeAgents();
